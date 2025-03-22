@@ -1,6 +1,6 @@
 <?php
 
-require_once 'aliyun-oss-php-sdk-2.4.3/autoload.php';
+require_once 'aliyun-oss-php-sdk-2.7.2/autoload.php';
 
 use OSS\OssClient;
 use OSS\Core\OssException;
@@ -155,6 +155,7 @@ class AliOssForTypecho_Plugin extends Typecho_Widget implements Typecho_Plugin_I
         $endPoint = new Typecho_Widget_Helper_Form_Element_Select('endPoint', 
             array(
                 "oss-cn-hangzhou"   =>  "华东1（杭州）oss-cn-hangzhou",
+                "oss-cn-guangzhou"   =>  "华南3（广州）oss-cn-guangzhou",
                 "oss-cn-shanghai"   =>  "华东2（上海）oss-cn-shanghai",
                 "oss-cn-qingdao"    =>  "华北1（青岛）oss-cn-qingdao",
                 "oss-cn-beijing"    =>  "华北2（北京）oss-cn-beijing",
@@ -210,6 +211,14 @@ class AliOssForTypecho_Plugin extends Typecho_Widget implements Typecho_Plugin_I
         
         $form->addInput(new Typecho_Widget_Helper_Form_Element_Radio('ifLoaclSave', array( "1" => '保留', "0" => '不保留' ), "1",
         _t('在服务器保留备份'), _t('是否在服务器保留备份')));
+
+        $maxFileSize = new Typecho_Widget_Helper_Form_Element_Text('maxFileSize', NULL, '10485760',
+            _t('最大文件大小'), _t('请填写最大文件大小，单位为字节，默认为10MB'));
+        $form->addInput($maxFileSize->addRule('isInteger', _t('请填写数字')));
+
+        $allowedMimeTypes = new Typecho_Widget_Helper_Form_Element_Text('allowedMimeTypes', NULL, 'image/jpeg,image/png,image/gif,image/bmp,image/webp',
+            _t('允许上传的文件类型'), _t('请填写允许上传的文件类型，以英文逗号分隔，默认为图片类型'));
+        $form->addInput($allowedMimeTypes);
 ?>
 <script>
 window.onload = function() {
@@ -266,11 +275,12 @@ window.onload = function() {
      * @param array $file 上传的文件
      * @return mixed
      */
-    public static function uploadHandle($file) {
-        if (empty($file['name'])) {
+     public static function uploadHandle($file) {
+        $fileName = htmlspecialchars($file['name'], ENT_QUOTES, 'UTF-8');
+        if (empty($fileName)) {
             return FALSE;
         }
-        $ext = self::getExtentionName($file['name']);
+        $ext = self::getExtentionName($fileName);
         if (!self::checkFileType($ext)) {
             return FALSE;
         }
@@ -281,7 +291,7 @@ window.onload = function() {
         } else {
             return FALSE;
         }
-
+    
         $upload_root = Typecho_Common::url(defined('__TYPECHO_UPLOAD_DIR__') ? __TYPECHO_UPLOAD_DIR__ : self::UPLOAD_DIR,
                             defined('__TYPECHO_UPLOAD_ROOT_DIR__') ? __TYPECHO_UPLOAD_ROOT_DIR__ : __TYPECHO_ROOT_DIR__);
         
@@ -293,7 +303,9 @@ window.onload = function() {
                 $options->plugin('AliOssForTypecho')->endPoint . $options->plugin('AliOssForTypecho')->endPointType);
         $access_id   = $options->plugin('AliOssForTypecho')->accessKeyId;
         $access_key  = $options->plugin('AliOssForTypecho')->accessKeySecret;
-
+        $maxFileSize = $options->plugin('AliOssForTypecho')->maxFileSize;
+        $allowedMimeTypes = $options->plugin('AliOssForTypecho')->allowedMimeTypes;
+        $allowedMimeTypes = array_map('trim', explode(',', $allowedMimeTypes));
         try {
             $oss_client = new OssClient($access_id, $access_key, $end_point);
             $oss_client->doesBucketExist($bucket_name);
@@ -305,99 +317,83 @@ window.onload = function() {
             return false;
         }
 
+        try{
+            // 检查文件大小
+            self::validateFileSize($file['size'], $maxFileSize);
+    
+            // 检查文件的 MIME 类型
+            self::validateFileMimeType($file['tmp_name'], $allowedMimeTypes);
+        }catch(Exception $e){
+            return "文件上传失败：" . $e->getMessage();
+        }
+    
         $save_on_server = $options->plugin('AliOssForTypecho')->ifLoaclSave;
-
-        $file_origin_name = self::getSafeName($file['name']);
-        $relative_path = date('Y/m/d/');
+    
+        // 生成时间戳文件名
+        // 获取当前时间的微秒部分
+        list($microseconds, $seconds) = explode(' ', microtime());
+        $milliseconds = round($microseconds * 1000); // 将微秒转换为毫秒
         
-        $remote_file_name = $user_dir . $relative_path . $file_origin_name;
-
+        // 获取当前时间的年月日时分秒
+        $date = date('YmdHis', $seconds);
+        
+        // 组合成完整的时间戳
+        $timestamp = $date . $milliseconds;
+        $file_origin_name = $timestamp . '.' . $ext; // 时间戳 + 原始文件名
+        $remote_file_name = $user_dir . $file_origin_name; // 远程文件名
+    
         if ($save_on_server === "1" && !Typecho_Common::isAppEngine()) {
-
             $upload_root = Typecho_Common::url(defined('__TYPECHO_UPLOAD_DIR__') ? __TYPECHO_UPLOAD_DIR__ : self::UPLOAD_DIR,
                             defined('__TYPECHO_UPLOAD_ROOT_DIR__') ? __TYPECHO_UPLOAD_ROOT_DIR__ : __TYPECHO_ROOT_DIR__);
             
-            $local_file_name = $upload_root . $relative_path . $file_origin_name;
-            try{
+            $local_file_name = $upload_root . $file_origin_name; // 本地文件名
+            try {
                 $exist_on_oss = $oss_client->doesObjectExist($bucket_name, $remote_file_name);
                 $exist_on_server = file_exists($local_file_name);
-            } catch(OssException $e) {
-                $error = '错误：检查OSS或本地服务器中中是否存在同名文件时失败' . "\r\n" .
+            } catch (OssException $e) {
+                $error = '错误：检查OSS或本地服务器中是否存在同名文件时失败' . "\r\n" .
                         '错误描述：' . $e->getMessage() . "\r\n" .
                         '时间：' . date('Y-m-d h:i:sa') . "\r\n\r\n";
                 self::my_error_log($error);
                 return false;
             }
-            
+    
             if ($exist_on_oss || $exist_on_server) {
-                // find a name neither exist on oss nor the server
-                $pathinfo = pathinfo($file_origin_name);
-                for ($i = 1;; $i++) {
-                    $file_origin_name = $pathinfo['filename'] . '(' . strval($i) . ').' . self::getExtentionName($file_origin_name);
-                    $remote_file_name = $user_dir . $relative_path . $file_origin_name;
-                    $local_file_name = $upload_root . $relative_path . $file_origin_name;
-                    
-                    try{
-                        $exist_on_oss = $oss_client->doesObjectExist($bucket_name, $remote_file_name);
-                        $exist_on_server = file_exists($local_file_name);
-                    } catch(OssException $e) {
-                        $error = '错误：检查OSS或本地服务器中中是否存在同名文件时失败' . "\r\n" .
-                                '错误描述：' . $e->getMessage() . "\r\n" .
-                                '时间：' . date('Y-m-d h:i:sa') . "\r\n\r\n";
-                        self::my_error_log($error);
-                        return false;
-                    }
-
-                    if ($exist_on_oss || $exist_on_server) {
-                    } else {
-                        break;
-                    }
-                }
+                // 如果文件名已存在，追加随机字符串
+                $randomString = bin2hex(random_bytes(4)); // 生成 8 位随机字符串
+                $file_origin_name = $timestamp . '_' . $randomString . '.' . $ext;
+                $remote_file_name = $user_dir . $file_origin_name;
+                $local_file_name = $upload_root . $file_origin_name;
             }
         } else {
-            try{
+            try {
                 $exist_on_oss = $oss_client->doesObjectExist($bucket_name, $remote_file_name);
-            } catch(OssException $e) {
+            } catch (OssException $e) {
                 $error = '错误：检查OSS中是否存在同名文件时失败' . "\r\n" .
-                                '错误描述：' . $e->getMessage() . "\r\n" .
-                                '时间：' . date('Y-m-d h:i:sa') . "\r\n\r\n";
+                        '错误描述：' . $e->getMessage() . "\r\n" .
+                        '时间：' . date('Y-m-d h:i:sa') . "\r\n\r\n";
                 self::my_error_log($error);
                 return false;
             }
-            if ($exist_on_oss || $exist_on_server) {
-                // find a name not exist on oss
-                $pathinfo = pathinfo($file_origin_name);
-                for ($i = 1;; $i++) {
-                    $file_origin_name = $pathinfo['filename'] . '(' . strval($i) . ').' . self::getExtentionName($file_origin_name);
-                    $remote_file_name = $user_dir . $relative_path . $file_origin_name;
-                    
-                    try{
-                        $exist_on_oss = $oss_client->doesObjectExist($bucket_name, $remote_file_name);
-                    } catch(OssException $e) {
-                        $error = '错误：检查OSS中是否存在同名文件时失败' . "\r\n" .
-                                '错误描述：' . $e->getMessage() . "\r\n" .
-                                '时间：' . date('Y-m-d h:i:sa') . "\r\n\r\n";
-                        self::my_error_log($error);
-                        return false;
-                    }
-
-                    if (!$exist_on_oss) {
-                        break;
-                    }
-                }
+    
+            if ($exist_on_oss) {
+                // 如果文件名已存在，追加随机字符串
+                $randomString = bin2hex(random_bytes(4)); // 生成 8 位随机字符串
+                $file_origin_name = $timestamp . '_' . $randomString . '.' . $ext;
+                $remote_file_name = $user_dir . $file_origin_name;
             }
         }
-
-        try{
+    
+        try {
             $ali_response = $oss_client->putObject($bucket_name, $remote_file_name, $content);
-        } catch(OssException $e) {
+        } catch (OssException $e) {
             $error = '错误：将文件储存到OSS失败' . "\r\n" .
                     '错误描述：' . $e->getMessage() . "\r\n" .
                     '时间：' . date('Y-m-d h:i:sa') . "\r\n\r\n";
             self::my_error_log($error);
             return false;
         }
-
+    
         if (200 != $ali_response['info']['http_code']) {
             $error = '错误：将文件储存到OSS时返回码不正常' . "\r\n" .
                     '错误码：' . $ali_response['info']['http_code'] . "\r\n" .
@@ -409,11 +405,11 @@ window.onload = function() {
             if ($save_on_server === "1" && !Typecho_Common::isAppEngine()) {
                 $file_dir_name = dirname($local_file_name);
                 $dir_exist = true;
-
+    
                 if (!is_dir($file_dir_name) && !self::makeUploadDir($file_dir_name)) {
                     $dir_exist = false;
                 }
-
+    
                 if ($dir_exist) {
                     if (!file_put_contents($local_file_name, $content)) {
                         $error = '错误：文件已保存到OSS，将文件储存到本地服务器时失败，请手动删除OSS上的文件，开启SELinux的用户注意合理配置权限。' . "\r\n" .
@@ -432,17 +428,17 @@ window.onload = function() {
                     return false;
                 }
             }
-
+    
             return array(
                 'name' => $file_origin_name,
-                'path' => $relative_path . $file_origin_name,
+                'path' => $file_origin_name, // 直接返回文件名
                 'size' => intval($ali_response['oss-requestheaders']['Content-Length']),
                 'type' => $ext,
                 'mime' => $ali_response['oss-requestheaders']['Content-Type']
             );
-            
         }
     }
+    
 
     /**
      * 修改文件处理函数
@@ -452,12 +448,13 @@ window.onload = function() {
      * @param array $file 新上传的文件
      * @return mixed
      */
-    public static function modifyHandle($content, $file)
-    {
-        if (empty($file['name'])) {
+     public static function modifyHandle($content, $file) {
+        $fileName = htmlspecialchars($file['name'], ENT_QUOTES, 'UTF-8');
+    
+        if (empty($fileName)) {
             return false;
         }
-        $ext = self::getExtentionName($file['name']);
+        $ext = self::getExtentionName($fileName);
         if ($content['attachment']->type != $ext) {
             return false;
         }
@@ -468,7 +465,7 @@ window.onload = function() {
         } else {
             return false;
         }
-
+    
         $options = Typecho_Widget::widget('Widget_Options');
         $userDir     = $options->plugin('AliOssForTypecho')->userDir;
         $bucket_name = $options->plugin('AliOssForTypecho')->bucketName;
@@ -477,16 +474,39 @@ window.onload = function() {
                 $options->plugin('AliOssForTypecho')->endPoint . $options->plugin('AliOssForTypecho')->endPointType);
         $access_id   = $options->plugin('AliOssForTypecho')->accessKeyId;
         $access_key  = $options->plugin('AliOssForTypecho')->accessKeySecret;
-         
+        $maxFileSize = $options->plugin('AliOssForTypecho')->maxFileSize;
+        $allowedMimeTypes = $options->plugin('AliOssForTypecho')->allowedMimeTypes;
+        $allowedMimeTypes = array_map('trim', explode(',', $allowedMimeTypes));
         $path = $content['attachment']->path;
+    
+        try{
+            // 检查文件大小
+            self::validateFileSize($file['size'], $maxFileSize);
+    
+            // 检查文件的 MIME 类型
+            self::validateFileMimeType($file['tmp_name'], $allowedMimeTypes);
+        }catch(Exception $e){
+            return "文件上传失败：" . $e->getMessage();
+        }
 
-        $remote_file_name = $userDir . $path;
+        // 生成时间戳文件名
+        // 获取当前时间的微秒部分
+        list($microseconds, $seconds) = explode(' ', microtime());
+        $milliseconds = round($microseconds * 1000); // 将微秒转换为毫秒
         
+        // 获取当前时间的年月日时分秒
+        $date = date('YmdHis', $seconds);
+        
+        // 组合成完整的时间戳
+        $timestamp = $date . $milliseconds;
+        $file_origin_name = $timestamp . '.' . $ext; // 时间戳 + 原始文件名
+        $remote_file_name = $userDir . $file_origin_name; // 远程文件名
+    
         $ifLoaclSave = $options->plugin('AliOssForTypecho')->ifLoaclSave;
         $upload_root = Typecho_Common::url(defined('__TYPECHO_UPLOAD_DIR__') ? __TYPECHO_UPLOAD_DIR__ : self::UPLOAD_DIR,
                     defined('__TYPECHO_UPLOAD_ROOT_DIR__') ? __TYPECHO_UPLOAD_ROOT_DIR__ : __TYPECHO_ROOT_DIR__);
-        $local_file_name = $upload_root . $path;
-
+        $local_file_name = $upload_root . $file_origin_name; // 本地文件名
+    
         if ($ifLoaclSave && (!is_writable($upload_root) || !is_writable($local_file_name))) {
             $error = '错误：修改文件失败，旧文件无写权限，开启SELinux的用户注意合理配置权限。' . "\r\n" .
                             '本地文件：' . $local_file_name . "\r\n" .
@@ -495,7 +515,7 @@ window.onload = function() {
             self::my_error_log($error);
             return false;
         }
-
+    
         try {
             $oss_client = new OssClient($access_id, $access_key, $end_point);
             $oss_client->doesBucketExist($bucket_name);
@@ -506,10 +526,10 @@ window.onload = function() {
             self::my_error_log($error);
             return false;
         }
-
-        try{
+    
+        try {
             $ali_response = $oss_client->putObject($bucket_name, $remote_file_name, $new_file_content);
-        } catch(OssException $e) {
+        } catch (OssException $e) {
             $error = '错误：将文件储存到OSS时失败' . "\r\n" .
                     '错误描述：' . $e->getMessage() . "\r\n" .
                     '时间：' . date('Y-m-d h:i:sa') . "\r\n\r\n";
@@ -534,14 +554,14 @@ window.onload = function() {
                     self::my_error_log($error);
                     return false;
                 }
-
+    
                 $file_dir_name = dirname($local_file_name);
                 $dir_exist = true;
-
+    
                 if (!is_dir($file_dir_name) && !self::makeUploadDir($file_dir_name)) {
                     $dir_exist = false;
                 }
-
+    
                 if ($dir_exist) {
                     if (!file_put_contents($local_file_name, $new_file_content)) {
                         $error = '错误：文件已保存到OSS，将文件储存到本地服务器时失败，请手动删除OSS上的文件' . "\r\n" .
@@ -561,15 +581,16 @@ window.onload = function() {
                 }
             }
         }
-
+    
         return array(
-            'name' => $content['attachment']->name,
-            'path' => $path,
+            'name' => $file_origin_name,
+            'path' => $file_origin_name, // 直接返回文件名
             'size' => intval($ali_response['oss-requestheaders']['Content-Length']),
             'type' => $ext,
             'mime' => $ali_response['oss-requestheaders']['Content-Type']
         );
     }
+    
 
     /**
      * 删除文件
@@ -765,6 +786,29 @@ window.onload = function() {
     private static function getExtentionName(&$name) {
         $info = pathinfo($name);
         return isset($info['extension']) ? strtolower($info['extension']) : '';
+    }
+
+    private static function validateFileMimeType($filePath, $allowedMimeTypes) {
+        // 使用 finfo_file 获取文件的 MIME 类型
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        $mimeType = finfo_file($finfo, $filePath);
+        finfo_close($finfo);
+    
+        // 检查 MIME 类型是否在允许的列表中
+        if (!in_array($mimeType, $allowedMimeTypes)) {
+            throw new Exception("文件类型不允许。");
+        }
+    
+        return true;
+    }
+    
+    private static function validateFileSize($fileSize, $maxSize) {
+        // 检查文件大小是否超过限制
+        if ($fileSize > $maxSize) {
+            throw new Exception("文件大小超过限制。");
+        }
+    
+        return true;
     }
 
 }
